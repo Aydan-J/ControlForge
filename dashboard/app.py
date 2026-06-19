@@ -172,6 +172,7 @@ def render_main_dashboard() -> None:
         "Navigation",
         [
             "Overview",
+            "Judge Demo",
             "Telemetry",
             "Visualization",
             "Control Panel",
@@ -190,6 +191,15 @@ def render_main_dashboard() -> None:
     if selected_page == "Overview":
         render_overview_page()
 
+    elif selected_page == "Judge Demo":
+        page_function = load_page_function(
+            file_name="judge_demo.py",
+            function_name="render_judge_demo_page",
+        )
+
+        if page_function:
+            page_function()
+            
     elif selected_page == "Telemetry":
         page_function = load_page_function(
             file_name="telemetry.py",

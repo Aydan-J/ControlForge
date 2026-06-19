@@ -1,9 +1,22 @@
-import time
-from datetime import datetime
+"""
+judge_demo.py
 
-import numpy as np
+ControlForge Judge Demo page.
+
+This version supports the CURRENT Arduino format:
+
+Upper: 178.48 deg | Lower: 136.54 deg | CartTicks: 5 | MotorPWM: 0 | Safety: FAULT
+
+It also supports CSV format if you switch Arduino back later:
+
+timestamp,theta1,theta2,theta1_dot,theta2_dot,cart_pos,cart_vel
+"""
+
+import math
+import re
+import time
+
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 try:
@@ -12,432 +25,300 @@ except ImportError:
     serial = None
 
 
-# ============================================================
-# Page setup
-# ============================================================
+def render_judge_demo_page():
+    st.title("🏆 ControlForge Judge Demo")
+    st.caption("Live hardware telemetry, variables, parameters, zeroing, graphs, and judge summary.")
 
-st.set_page_config(
-    page_title="ControlForge Judge Demo",
-    page_icon="🏆",
-    layout="wide"
-)
+    st.info(
+        "Demo focus: ControlForge connects a physical double inverted pendulum "
+        "to a real-time software dashboard using Teensy serial telemetry."
+    )
 
-STATE_COLUMNS = [
-    "timestamp_ms",
-    "theta1",
-    "theta2",
-    "theta1_dot",
-    "theta2_dot",
-    "cart_pos",
-    "cart_vel",
-]
+    st.warning(
+        "Close Arduino Serial Monitor and Serial Plotter before using this page. "
+        "Only one program can use COM3 at a time."
+    )
 
-DISPLAY_NAMES = {
-    "theta1": "Theta 1",
-    "theta2": "Theta 2",
-    "theta1_dot": "Theta 1 Velocity",
-    "theta2_dot": "Theta 2 Velocity",
-    "cart_pos": "Cart Position",
-    "cart_vel": "Cart Velocity",
-}
+    # ============================================================
+    # Session state
+    # ============================================================
 
-
-# ============================================================
-# Session state
-# ============================================================
-
-if "judge_history" not in st.session_state:
-    st.session_state.judge_history = []
-
-if "judge_start_time" not in st.session_state:
-    st.session_state.judge_start_time = time.time()
-
-if "judge_packet_count" not in st.session_state:
-    st.session_state.judge_packet_count = 0
-
-if "judge_invalid_count" not in st.session_state:
-    st.session_state.judge_invalid_count = 0
-
-if "judge_last_raw_packet" not in st.session_state:
-    st.session_state.judge_last_raw_packet = ""
-
-if "judge_status_message" not in st.session_state:
-    st.session_state.judge_status_message = "Demo ready."
-
-
-# ============================================================
-# Packet helpers
-# ============================================================
-
-def parse_packet(raw_line: str):
-    """
-    Expected packet format:
-    timestamp,theta1,theta2,theta1_dot,theta2_dot,cart_pos,cart_vel
-    """
-
-    if not raw_line:
-        raise ValueError("Empty packet.")
-
-    parts = raw_line.strip().split(",")
-
-    if len(parts) != 7:
-        raise ValueError(f"Expected 7 values, got {len(parts)}.")
-
-    values = [float(part) for part in parts]
-
-    return {
-        "timestamp_ms": values[0],
-        "theta1": values[1],
-        "theta2": values[2],
-        "theta1_dot": values[3],
-        "theta2_dot": values[4],
-        "cart_pos": values[5],
-        "cart_vel": values[6],
+    defaults = {
+        "judge_history": [],
+        "judge_last_raw": "",
+        "judge_status": "Waiting for hardware packets.",
+        "judge_valid_packets": 0,
+        "judge_invalid_packets": 0,
+        "theta1_zero": 0.0,
+        "theta2_zero": 0.0,
+        "cart_zero": 0.0,
+        "theta1_flip": False,
+        "theta2_flip": False,
+        "previous_packet": None,
     }
 
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-def generate_demo_packet():
-    """
-    Generates fake judge-demo telemetry.
-    This matches the same 7-value format the Teensy sends.
-    """
+    # ============================================================
+    # Helper functions
+    # ============================================================
 
-    timestamp_ms = int((time.time() - st.session_state.judge_start_time) * 1000)
-    t = timestamp_ms / 1000.0
+    def wrap_to_pi(angle):
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
 
-    theta1 = 0.25 * np.sin(t)
-    theta2 = -0.35 * np.cos(t * 0.8)
-    theta1_dot = 0.05 * np.cos(t)
-    theta2_dot = 0.05 * np.sin(t * 0.8)
-    cart_pos = 0.10 * np.sin(t * 0.5)
-    cart_vel = 0.06 * np.cos(t * 0.5)
+    def angle_difference(current_angle, previous_angle):
+        return wrap_to_pi(current_angle - previous_angle)
 
-    raw_packet = (
-        f"{timestamp_ms},"
-        f"{theta1:.4f},"
-        f"{theta2:.4f},"
-        f"{theta1_dot:.4f},"
-        f"{theta2_dot:.4f},"
-        f"{cart_pos:.4f},"
-        f"{cart_vel:.4f}"
-    )
+    def parse_packet(raw_line):
+        """
+        Supports two formats:
 
-    return raw_packet
+        1. Human-readable Arduino format:
+           Upper: 178.48 deg | Lower: 136.54 deg | CartTicks: 5 | MotorPWM: 0 | Safety: FAULT
 
+        2. CSV format:
+           timestamp,theta1,theta2,theta1_dot,theta2_dot,cart_pos,cart_vel
+        """
 
-def read_serial_packet(port: str, baud_rate: int, timeout: float):
-    """
-    Reads one packet from the Teensy.
-    This is read-only. It does not send anything back.
-    """
+        raw_line = raw_line.strip()
 
-    if serial is None:
-        raise ImportError("pyserial is not installed. Run: pip install pyserial")
+        if raw_line == "":
+            raise ValueError("Empty serial line.")
 
-    with serial.Serial(port=port, baudrate=baud_rate, timeout=timeout) as ser:
-        raw_bytes = ser.readline()
+        # ========================================================
+        # Format 1: CSV
+        # ========================================================
 
-    return raw_bytes.decode(errors="ignore").strip()
+        if "," in raw_line:
+            parts = [part.strip() for part in raw_line.split(",")]
 
+            if len(parts) != 7:
+                raise ValueError(
+                    f"CSV packet found, but expected 7 values and got {len(parts)}. Raw: {raw_line}"
+                )
 
-def add_packet_to_history(packet_dict):
-    st.session_state.judge_history.append(packet_dict)
-    st.session_state.judge_packet_count += 1
+            values = [float(part) for part in parts]
 
-    max_history = 500
-    if len(st.session_state.judge_history) > max_history:
-        st.session_state.judge_history = st.session_state.judge_history[-max_history:]
+            packet = {
+                "timestamp_ms": values[0],
+                "theta1": values[1],
+                "theta2": values[2],
+                "theta1_dot": values[3],
+                "theta2_dot": values[4],
+                "cart_pos": values[5],
+                "cart_vel": values[6],
+                "motor_pwm": 0,
+                "safety": "UNKNOWN",
+                "raw": raw_line,
+            }
 
+            st.session_state.previous_packet = packet
+            return packet
 
-def get_history_df():
-    if not st.session_state.judge_history:
-        return pd.DataFrame(columns=STATE_COLUMNS)
+        # ========================================================
+        # Format 2: Human-readable Arduino line
+        # ========================================================
 
-    return pd.DataFrame(st.session_state.judge_history)
-
-
-# ============================================================
-# Visualization helpers
-# ============================================================
-
-def make_pendulum_figure(theta1, theta2, cart_pos, theta2_mode="Relative angle"):
-    """
-    Draws a cart double pendulum.
-
-    theta1: first arm angle
-    theta2: second arm angle
-    cart_pos: cart x-position
-    theta2_mode:
-        - Relative angle: theta2 is measured from first arm
-        - Absolute angle: theta2 is measured from vertical
-    """
-
-    l1 = 1.0
-    l2 = 0.8
-
-    cart_width = 0.45
-    cart_height = 0.22
-    wheel_radius = 0.06
-
-    cart_x = cart_pos
-    cart_y = 0.0
-
-    joint1_x = cart_x
-    joint1_y = cart_y + cart_height / 2
-
-    # First arm: angle from vertical
-    x1 = joint1_x + l1 * np.sin(theta1)
-    y1 = joint1_y - l1 * np.cos(theta1)
-
-    if theta2_mode == "Relative angle":
-        theta2_absolute = theta1 + theta2
-    else:
-        theta2_absolute = theta2
-
-    x2 = x1 + l2 * np.sin(theta2_absolute)
-    y2 = y1 - l2 * np.cos(theta2_absolute)
-
-    fig = go.Figure()
-
-    # Track
-    fig.add_trace(go.Scatter(
-        x=[-1.5, 1.5],
-        y=[-0.18, -0.18],
-        mode="lines",
-        line=dict(width=6),
-        name="Track"
-    ))
-
-    # Cart body
-    fig.add_shape(
-        type="rect",
-        x0=cart_x - cart_width / 2,
-        y0=cart_y - cart_height / 2,
-        x1=cart_x + cart_width / 2,
-        y1=cart_y + cart_height / 2,
-        line=dict(width=2),
-        fillcolor="rgba(120,120,120,0.25)",
-    )
-
-    # Wheels
-    for wx in [cart_x - 0.14, cart_x + 0.14]:
-        fig.add_shape(
-            type="circle",
-            x0=wx - wheel_radius,
-            y0=-0.18 - wheel_radius,
-            x1=wx + wheel_radius,
-            y1=-0.18 + wheel_radius,
-            line=dict(width=2),
-            fillcolor="rgba(80,80,80,0.25)",
+        pattern = (
+            r"Upper:\s*([-+]?\d*\.?\d+)\s*deg\s*\|\s*"
+            r"Lower:\s*([-+]?\d*\.?\d+)\s*deg\s*\|\s*"
+            r"CartTicks:\s*([-+]?\d+)\s*\|\s*"
+            r"MotorPWM:\s*([-+]?\d+)\s*\|\s*"
+            r"Safety:\s*([A-Za-z]+)"
         )
 
-    # Pendulum arms
-    fig.add_trace(go.Scatter(
-        x=[joint1_x, x1, x2],
-        y=[joint1_y, y1, y2],
-        mode="lines+markers",
-        line=dict(width=6),
-        marker=dict(size=[12, 14, 18]),
-        name="Double Pendulum"
-    ))
+        match = re.search(pattern, raw_line)
 
-    # Labels
-    fig.add_annotation(
-        x=cart_x,
-        y=0.32,
-        text=f"cart_pos = {cart_pos:.3f}",
-        showarrow=False
-    )
+        if not match:
+            raise ValueError(f"Could not parse Arduino line: {raw_line}")
 
-    fig.add_annotation(
-        x=x1,
-        y=y1 + 0.15,
-        text=f"θ1 = {theta1:.3f}",
-        showarrow=False
-    )
+        upper_deg = float(match.group(1))
+        lower_deg = float(match.group(2))
+        cart_ticks = float(match.group(3))
+        motor_pwm = int(match.group(4))
+        safety = match.group(5)
 
-    fig.add_annotation(
-        x=x2,
-        y=y2 - 0.15,
-        text=f"θ2 = {theta2:.3f}",
-        showarrow=False
-    )
+        now_ms = time.time() * 1000.0
 
-    fig.update_layout(
-        height=520,
-        margin=dict(l=10, r=10, t=30, b=10),
-        xaxis=dict(range=[-1.7, 1.7], zeroline=False, showgrid=True),
-        yaxis=dict(range=[-2.1, 0.7], zeroline=False, showgrid=True, scaleanchor="x", scaleratio=1),
-        showlegend=False,
-        title="Live Cart Double Pendulum Visualization"
-    )
+        theta1 = math.radians(upper_deg)
+        theta2 = math.radians(lower_deg)
+        cart_pos = cart_ticks
 
-    return fig
+        theta1_dot = 0.0
+        theta2_dot = 0.0
+        cart_vel = 0.0
 
+        previous = st.session_state.previous_packet
 
-# ============================================================
-# Analysis helpers
-# ============================================================
+        if previous is not None:
+            dt = (now_ms - previous["timestamp_ms"]) / 1000.0
 
-def analyze_system_health(latest_packet, df):
-    """
-    Simple judge-facing health monitor.
-    This is not motor control. It only analyzes incoming data.
-    """
+            if dt > 0:
+                theta1_dot = angle_difference(theta1, previous["theta1"]) / dt
+                theta2_dot = angle_difference(theta2, previous["theta2"]) / dt
+                cart_vel = (cart_pos - previous["cart_pos"]) / dt
 
-    warnings = []
-
-    theta1 = abs(latest_packet["theta1"])
-    theta2 = abs(latest_packet["theta2"])
-    theta1_dot = abs(latest_packet["theta1_dot"])
-    theta2_dot = abs(latest_packet["theta2_dot"])
-    cart_pos = abs(latest_packet["cart_pos"])
-
-    if theta1 > 0.75:
-        warnings.append("Theta 1 angle is large.")
-
-    if theta2 > 0.75:
-        warnings.append("Theta 2 angle is large.")
-
-    if theta1_dot > 1.5:
-        warnings.append("Theta 1 velocity is high.")
-
-    if theta2_dot > 1.5:
-        warnings.append("Theta 2 velocity is high.")
-
-    if cart_pos > 0.8:
-        warnings.append("Cart position is near the safety range limit.")
-
-    if len(df) >= 2:
-        latest_time = df["timestamp_ms"].iloc[-1]
-        previous_time = df["timestamp_ms"].iloc[-2]
-        delta = latest_time - previous_time
-
-        if delta > 1000:
-            warnings.append("Telemetry update delay detected.")
-
-    if not warnings:
-        return "Stable", "Low", "No anomalies detected."
-
-    if len(warnings) <= 2:
-        return "Caution", "Medium", " ".join(warnings)
-
-    return "Unstable", "High", " ".join(warnings)
-
-
-def make_run_summary(df):
-    if df.empty:
-        return {
-            "duration_s": 0,
-            "packets": 0,
-            "max_theta1": 0,
-            "max_theta2": 0,
-            "max_cart_pos": 0,
-            "avg_theta1": 0,
-            "avg_theta2": 0,
-            "avg_cart_pos": 0,
-            "telemetry_health": 0,
+        packet = {
+            "timestamp_ms": now_ms,
+            "theta1": theta1,
+            "theta2": theta2,
+            "theta1_dot": theta1_dot,
+            "theta2_dot": theta2_dot,
+            "cart_pos": cart_pos,
+            "cart_vel": cart_vel,
+            "motor_pwm": motor_pwm,
+            "safety": safety,
+            "raw": raw_line,
         }
 
-    duration_s = (df["timestamp_ms"].max() - df["timestamp_ms"].min()) / 1000
-    packets = len(df)
+        st.session_state.previous_packet = packet
+        return packet
 
-    total_packets = st.session_state.judge_packet_count + st.session_state.judge_invalid_count
+    def close_serial_connections():
+        for key in list(st.session_state.keys()):
+            if key.startswith("judge_serial_"):
+                try:
+                    st.session_state[key].close()
+                except Exception:
+                    pass
+                del st.session_state[key]
 
-    if total_packets == 0:
-        telemetry_health = 0
-    else:
-        telemetry_health = (st.session_state.judge_packet_count / total_packets) * 100
+    def read_one_serial_line(port, baud_rate, timeout):
+        if serial is None:
+            raise ImportError("pyserial is not installed. Run: python -m pip install pyserial")
 
-    return {
-        "duration_s": duration_s,
-        "packets": packets,
-        "max_theta1": df["theta1"].abs().max(),
-        "max_theta2": df["theta2"].abs().max(),
-        "max_cart_pos": df["cart_pos"].abs().max(),
-        "avg_theta1": df["theta1"].mean(),
-        "avg_theta2": df["theta2"].mean(),
-        "avg_cart_pos": df["cart_pos"].mean(),
-        "telemetry_health": telemetry_health,
-    }
+        serial_key = f"judge_serial_{port}_{baud_rate}"
 
+        if serial_key not in st.session_state:
+            try:
+                st.session_state[serial_key] = serial.Serial(
+                    port=port,
+                    baudrate=baud_rate,
+                    timeout=timeout,
+                )
+            except Exception as error:
+                raise RuntimeError(
+                    f"Could not open {port}. Close Arduino Serial Monitor, stop other Python processes, "
+                    f"then click Reconnect Serial. Details: {error}"
+                )
 
-def make_summary_text(summary, health_status, risk_level, health_message):
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            time.sleep(2.0)
 
-    text = f"""
-ControlForge Demo Run Summary
-Generated: {created_at}
+            try:
+                st.session_state[serial_key].reset_input_buffer()
+            except Exception:
+                pass
 
-Experiment Duration: {summary["duration_s"]:.2f} seconds
-Valid Packets Received: {summary["packets"]}
-Invalid Packets: {st.session_state.judge_invalid_count}
-Telemetry Health: {summary["telemetry_health"]:.1f}%
+        ser = st.session_state[serial_key]
 
-Maximum Theta 1: {summary["max_theta1"]:.4f} rad
-Maximum Theta 2: {summary["max_theta2"]:.4f} rad
-Maximum Cart Position: {summary["max_cart_pos"]:.4f} m
+        for _ in range(50):
+            raw_bytes = ser.readline()
+            raw_line = raw_bytes.decode(errors="ignore").strip()
 
-Average Theta 1: {summary["avg_theta1"]:.4f} rad
-Average Theta 2: {summary["avg_theta2"]:.4f} rad
-Average Cart Position: {summary["avg_cart_pos"]:.4f} m
+            if raw_line:
+                return raw_line
 
-System Health: {health_status}
-Risk Level: {risk_level}
-Health Notes: {health_message}
+        raise ValueError("No serial data received from Teensy.")
 
-Safety Mode:
-Read-only telemetry is enabled. No motor commands were sent.
-"""
-    return text.strip()
+    def add_packet(packet, max_history_rows):
+        st.session_state.judge_history.append(packet)
+        st.session_state.judge_valid_packets += 1
 
+        if len(st.session_state.judge_history) > max_history_rows:
+            st.session_state.judge_history = st.session_state.judge_history[-max_history_rows:]
 
-# ============================================================
-# Header
-# ============================================================
+    def get_zeroed_values(latest):
+        theta1_zeroed = wrap_to_pi(latest["theta1"] - st.session_state.theta1_zero)
+        theta2_zeroed = wrap_to_pi(latest["theta2"] - st.session_state.theta2_zero)
+        cart_zeroed = latest["cart_pos"] - st.session_state.cart_zero
 
-st.title("🏆 ControlForge Judge Demo")
-st.caption(
-    "A polished live demo page combining telemetry, visualization, system health, "
-    "and an automatic run summary report."
-)
+        if st.session_state.theta1_flip:
+            theta1_zeroed = -theta1_zeroed
 
-st.info(
-    "Safety status: ControlForge is currently in read-only mode. "
-    "This page reads telemetry and visualizes it, but it does not send motor commands."
-)
+        if st.session_state.theta2_flip:
+            theta2_zeroed = -theta2_zeroed
 
+        return theta1_zeroed, theta2_zeroed, cart_zeroed
 
-# ============================================================
-# Sidebar controls
-# ============================================================
+    def classify_health(latest, theta_limit_rad, velocity_limit_rad_s, cart_limit_ticks):
+        if len(st.session_state.judge_history) == 0:
+            return "Waiting", "Low", "Waiting for live hardware packets."
 
-st.sidebar.header("Demo Controls")
+        if latest["safety"].upper() == "FAULT":
+            return "Safety Fault", "High", "Arduino reported Safety: FAULT."
 
-data_source = st.sidebar.radio(
-    "Data Source",
-    ["Built-in Demo Telemetry", "Hardware Serial Read-Only"],
-)
+        warnings = []
 
-theta2_mode = st.sidebar.selectbox(
-    "Theta 2 Interpretation",
-    ["Relative angle", "Absolute angle"],
-)
+        if abs(latest["theta1"]) > theta_limit_rad:
+            warnings.append("Upper angle is outside selected range.")
 
-auto_update = st.sidebar.checkbox("Auto-update demo", value=True)
+        if abs(latest["theta2"]) > theta_limit_rad:
+            warnings.append("Lower angle is outside selected range.")
 
-refresh_delay = st.sidebar.slider(
-    "Refresh delay",
-    min_value=0.05,
-    max_value=1.00,
-    value=0.20,
-    step=0.05,
-)
+        if abs(latest["theta1_dot"]) > velocity_limit_rad_s:
+            warnings.append("Upper angular velocity is high.")
 
-if data_source == "Hardware Serial Read-Only":
-    st.sidebar.subheader("Serial Settings")
+        if abs(latest["theta2_dot"]) > velocity_limit_rad_s:
+            warnings.append("Lower angular velocity is high.")
+
+        if abs(latest["cart_pos"]) > cart_limit_ticks:
+            warnings.append("Cart position is outside selected range.")
+
+        if warnings:
+            return "Caution", "Medium", " ".join(warnings)
+
+        return "Stable", "Low", "Live telemetry is being received."
+
+    def make_summary(df):
+        total_packets = st.session_state.judge_valid_packets + st.session_state.judge_invalid_packets
+
+        telemetry_health = 0.0
+        if total_packets > 0:
+            telemetry_health = (st.session_state.judge_valid_packets / total_packets) * 100.0
+
+        if df.empty:
+            return {
+                "duration_s": 0.0,
+                "max_theta1": 0.0,
+                "max_theta2": 0.0,
+                "max_theta1_dot": 0.0,
+                "max_theta2_dot": 0.0,
+                "max_cart_pos": 0.0,
+                "max_cart_vel": 0.0,
+                "avg_theta1": 0.0,
+                "avg_theta2": 0.0,
+                "telemetry_health": telemetry_health,
+            }
+
+        duration_s = (df["timestamp_ms"].max() - df["timestamp_ms"].min()) / 1000.0
+
+        return {
+            "duration_s": duration_s,
+            "max_theta1": df["theta1"].abs().max(),
+            "max_theta2": df["theta2"].abs().max(),
+            "max_theta1_dot": df["theta1_dot"].abs().max(),
+            "max_theta2_dot": df["theta2_dot"].abs().max(),
+            "max_cart_pos": df["cart_pos"].abs().max(),
+            "max_cart_vel": df["cart_vel"].abs().max(),
+            "avg_theta1": df["theta1"].mean(),
+            "avg_theta2": df["theta2"].mean(),
+            "telemetry_health": telemetry_health,
+        }
+
+    # ============================================================
+    # Sidebar controls
+    # ============================================================
+
+    st.sidebar.header("Serial Parameters")
 
     port = st.sidebar.text_input("COM Port", value="COM3")
+
     baud_rate = st.sidebar.number_input(
         "Baud Rate",
         min_value=9600,
@@ -445,248 +326,393 @@ if data_source == "Hardware Serial Read-Only":
         value=115200,
         step=9600,
     )
+
     timeout = st.sidebar.number_input(
-        "Timeout",
+        "Serial Timeout",
         min_value=0.05,
         max_value=5.0,
         value=1.0,
         step=0.05,
     )
-else:
-    port = "COM3"
-    baud_rate = 115200
-    timeout = 1.0
 
-read_button = st.sidebar.button("Read One Packet")
-
-clear_button = st.sidebar.button("Clear Demo Run")
-
-if clear_button:
-    st.session_state.judge_history = []
-    st.session_state.judge_packet_count = 0
-    st.session_state.judge_invalid_count = 0
-    st.session_state.judge_last_raw_packet = ""
-    st.session_state.judge_start_time = time.time()
-    st.session_state.judge_status_message = "Demo run cleared."
-    st.rerun()
-
-
-# ============================================================
-# Read packet
-# ============================================================
-
-should_read = read_button or auto_update
-
-if should_read:
-    try:
-        if data_source == "Built-in Demo Telemetry":
-            raw_packet = generate_demo_packet()
-        else:
-            raw_packet = read_serial_packet(port, int(baud_rate), float(timeout))
-
-        st.session_state.judge_last_raw_packet = raw_packet
-        packet = parse_packet(raw_packet)
-        add_packet_to_history(packet)
-
-        st.session_state.judge_status_message = "Valid packet received."
-
-    except Exception as e:
-        st.session_state.judge_invalid_count += 1
-        st.session_state.judge_status_message = f"Packet error: {e}"
-
-
-df = get_history_df()
-
-if df.empty:
-    latest = {
-        "timestamp_ms": 0,
-        "theta1": 0,
-        "theta2": 0,
-        "theta1_dot": 0,
-        "theta2_dot": 0,
-        "cart_pos": 0,
-        "cart_vel": 0,
-    }
-else:
-    latest = df.iloc[-1].to_dict()
-
-
-health_status, risk_level, health_message = analyze_system_health(latest, df)
-summary = make_run_summary(df)
-summary_text = make_summary_text(summary, health_status, risk_level, health_message)
-
-
-# ============================================================
-# Main dashboard layout
-# ============================================================
-
-top1, top2, top3, top4 = st.columns(4)
-
-top1.metric("System Health", health_status)
-top2.metric("Risk Level", risk_level)
-top3.metric("Valid Packets", st.session_state.judge_packet_count)
-top4.metric("Telemetry Health", f"{summary['telemetry_health']:.1f}%")
-
-st.caption(st.session_state.judge_status_message)
-
-left_col, right_col = st.columns([1.35, 1])
-
-with left_col:
-    fig = make_pendulum_figure(
-        latest["theta1"],
-        latest["theta2"],
-        latest["cart_pos"],
-        theta2_mode=theta2_mode,
+    read_attempts = st.sidebar.number_input(
+        "Read Attempts Per Refresh",
+        min_value=1,
+        max_value=20,
+        value=5,
+        step=1,
     )
-    st.plotly_chart(fig, use_container_width=True)
 
-with right_col:
-    st.subheader("Live Telemetry")
+    max_history_rows = st.sidebar.number_input(
+        "Max Stored Packets",
+        min_value=50,
+        max_value=10000,
+        value=2000,
+        step=50,
+    )
 
-    c1, c2 = st.columns(2)
+    st.sidebar.divider()
+    st.sidebar.header("Live Read Controls")
 
-    with c1:
-        st.metric("Theta 1", f"{latest['theta1']:.4f} rad")
-        st.metric("Theta 1 Velocity", f"{latest['theta1_dot']:.4f} rad/s")
-        st.metric("Cart Position", f"{latest['cart_pos']:.4f} m")
+    read_button = st.sidebar.button("Read One Packet", type="primary")
+    auto_read = st.sidebar.checkbox("Auto-read live hardware", value=False)
 
-    with c2:
-        st.metric("Theta 2", f"{latest['theta2']:.4f} rad")
-        st.metric("Theta 2 Velocity", f"{latest['theta2_dot']:.4f} rad/s")
-        st.metric("Cart Velocity", f"{latest['cart_vel']:.4f} m/s")
+    refresh_delay = st.sidebar.slider(
+        "Auto-read Delay",
+        min_value=0.10,
+        max_value=2.00,
+        value=0.25,
+        step=0.05,
+    )
 
-    st.subheader("Health Notes")
+    reconnect_button = st.sidebar.button("Reconnect Serial")
+    clear_button = st.sidebar.button("Clear Demo Run")
+
+    st.sidebar.divider()
+    st.sidebar.header("Zeroing / Calibration")
+
+    zero_button = st.sidebar.button("Zero Current Position")
+
+    st.session_state.theta1_flip = st.sidebar.checkbox(
+        "Flip θ1 Direction",
+        value=st.session_state.theta1_flip,
+    )
+
+    st.session_state.theta2_flip = st.sidebar.checkbox(
+        "Flip θ2 Direction",
+        value=st.session_state.theta2_flip,
+    )
+
+    st.sidebar.caption(
+        f"θ1 zero: {st.session_state.theta1_zero:.4f} rad\n\n"
+        f"θ2 zero: {st.session_state.theta2_zero:.4f} rad\n\n"
+        f"Cart zero: {st.session_state.cart_zero:.2f} ticks"
+    )
+
+    st.sidebar.divider()
+    st.sidebar.header("Safety Parameters")
+
+    theta_limit_rad = st.sidebar.number_input(
+        "Angle Warning Limit (rad)",
+        min_value=0.1,
+        max_value=10.0,
+        value=3.2,
+        step=0.1,
+    )
+
+    velocity_limit_rad_s = st.sidebar.number_input(
+        "Velocity Warning Limit (rad/s)",
+        min_value=0.1,
+        max_value=100.0,
+        value=10.0,
+        step=0.5,
+    )
+
+    cart_limit_ticks = st.sidebar.number_input(
+        "Cart Warning Limit (ticks)",
+        min_value=10.0,
+        max_value=100000.0,
+        value=5000.0,
+        step=100.0,
+    )
+
+    # ============================================================
+    # Button actions
+    # ============================================================
+
+    if reconnect_button:
+        close_serial_connections()
+        st.session_state.judge_status = "Serial connection reset. Click Read One Packet."
+        st.rerun()
+
+    if clear_button:
+        st.session_state.judge_history = []
+        st.session_state.judge_last_raw = ""
+        st.session_state.judge_status = "Demo run cleared."
+        st.session_state.judge_valid_packets = 0
+        st.session_state.judge_invalid_packets = 0
+        st.session_state.previous_packet = None
+        close_serial_connections()
+        st.rerun()
+
+    # ============================================================
+    # Serial read
+    # ============================================================
+
+    if read_button or auto_read:
+        packet = None
+        last_error = None
+
+        try:
+            for _ in range(int(read_attempts)):
+                raw_line = read_one_serial_line(port, int(baud_rate), float(timeout))
+                st.session_state.judge_last_raw = raw_line
+
+                try:
+                    packet = parse_packet(raw_line)
+                    break
+                except Exception as parse_error:
+                    last_error = parse_error
+                    st.session_state.judge_invalid_packets += 1
+
+            if packet is None:
+                raise ValueError(f"No valid packet found. Last error: {last_error}")
+
+            add_packet(packet, int(max_history_rows))
+            st.session_state.judge_status = "Live hardware packet received."
+
+        except Exception as read_error:
+            st.session_state.judge_invalid_packets += 1
+            st.session_state.judge_status = f"Read error: {read_error}"
+
+    # ============================================================
+    # Latest packet
+    # ============================================================
+
+    if st.session_state.judge_history:
+        latest = st.session_state.judge_history[-1]
+    else:
+        latest = {
+            "timestamp_ms": 0.0,
+            "theta1": 0.0,
+            "theta2": 0.0,
+            "theta1_dot": 0.0,
+            "theta2_dot": 0.0,
+            "cart_pos": 0.0,
+            "cart_vel": 0.0,
+            "motor_pwm": 0,
+            "safety": "UNKNOWN",
+            "raw": "",
+        }
+
+    if zero_button:
+        st.session_state.theta1_zero = latest["theta1"]
+        st.session_state.theta2_zero = latest["theta2"]
+        st.session_state.cart_zero = latest["cart_pos"]
+        st.session_state.judge_status = "Current state saved as zero reference."
+        st.rerun()
+
+    theta1_zeroed, theta2_zeroed, cart_zeroed = get_zeroed_values(latest)
+
+    df = pd.DataFrame(st.session_state.judge_history) if st.session_state.judge_history else pd.DataFrame()
+    summary = make_summary(df)
+
+    health_status, risk_level, health_message = classify_health(
+        latest,
+        theta_limit_rad,
+        velocity_limit_rad_s,
+        cart_limit_ticks,
+    )
+
+    # ============================================================
+    # Dashboard display
+    # ============================================================
+
+    top1, top2, top3, top4, top5 = st.columns(5)
+
+    top1.metric("System Health", health_status)
+    top2.metric("Risk Level", risk_level)
+    top3.metric("Safety", latest["safety"])
+    top4.metric("Packets", len(st.session_state.judge_history))
+    top5.metric("Motor PWM", latest["motor_pwm"])
+
     if health_status == "Stable":
         st.success(health_message)
-    elif health_status == "Caution":
-        st.warning(health_message)
+    elif health_status == "Waiting":
+        st.info(health_message)
     else:
-        st.error(health_message)
+        st.warning(health_message)
 
-    st.subheader("Latest Raw Packet")
-    st.code(st.session_state.judge_last_raw_packet or "No packet yet.")
+    st.caption(st.session_state.judge_status)
 
+    st.divider()
+    st.header("Live Hardware Measurements")
 
-# ============================================================
-# Run summary report
-# ============================================================
+    raw_col, zero_col, velocity_col = st.columns(3)
 
-st.divider()
-st.header("📄 Demo Run Summary Report")
+    with raw_col:
+        st.subheader("Raw Variables")
+        st.metric("Upper Angle / θ1", f"{latest['theta1']:.4f} rad")
+        st.metric("Lower Angle / θ2", f"{latest['theta2']:.4f} rad")
+        st.metric("Cart Position", f"{latest['cart_pos']:.2f} ticks")
 
-r1, r2, r3, r4 = st.columns(4)
+    with zero_col:
+        st.subheader("Zeroed Variables")
+        st.metric("θ1 Zeroed", f"{theta1_zeroed:.4f} rad")
+        st.metric("θ2 Zeroed", f"{theta2_zeroed:.4f} rad")
+        st.metric("Cart Zeroed", f"{cart_zeroed:.2f} ticks")
 
-r1.metric("Duration", f"{summary['duration_s']:.2f} s")
-r2.metric("Max θ1", f"{summary['max_theta1']:.4f} rad")
-r3.metric("Max θ2", f"{summary['max_theta2']:.4f} rad")
-r4.metric("Max Cart Pos", f"{summary['max_cart_pos']:.4f} m")
+    with velocity_col:
+        st.subheader("Velocity Variables")
+        st.metric("θ1 Velocity", f"{latest['theta1_dot']:.4f} rad/s")
+        st.metric("θ2 Velocity", f"{latest['theta2_dot']:.4f} rad/s")
+        st.metric("Cart Velocity", f"{latest['cart_vel']:.2f} ticks/s")
 
-r5, r6, r7, r8 = st.columns(4)
+    st.subheader("Latest Raw Serial")
+    st.code(st.session_state.judge_last_raw or "No serial data yet.")
 
-r5.metric("Average θ1", f"{summary['avg_theta1']:.4f} rad")
-r6.metric("Average θ2", f"{summary['avg_theta2']:.4f} rad")
-r7.metric("Average Cart Pos", f"{summary['avg_cart_pos']:.4f} m")
-r8.metric("Invalid Packets", st.session_state.judge_invalid_count)
+    st.divider()
+    st.header("Current Parameters")
 
-with st.expander("View full generated report"):
-    st.text(summary_text)
+    parameters_df = pd.DataFrame(
+        [
+            {"Parameter": "COM Port", "Value": port},
+            {"Parameter": "Baud Rate", "Value": int(baud_rate)},
+            {"Parameter": "Timeout", "Value": float(timeout)},
+            {"Parameter": "Read Attempts", "Value": int(read_attempts)},
+            {"Parameter": "Max Stored Packets", "Value": int(max_history_rows)},
+            {"Parameter": "θ1 Zero Offset", "Value": st.session_state.theta1_zero},
+            {"Parameter": "θ2 Zero Offset", "Value": st.session_state.theta2_zero},
+            {"Parameter": "Cart Zero Offset", "Value": st.session_state.cart_zero},
+            {"Parameter": "Flip θ1", "Value": st.session_state.theta1_flip},
+            {"Parameter": "Flip θ2", "Value": st.session_state.theta2_flip},
+            {"Parameter": "Angle Warning Limit", "Value": theta_limit_rad},
+            {"Parameter": "Velocity Warning Limit", "Value": velocity_limit_rad_s},
+            {"Parameter": "Cart Warning Limit", "Value": cart_limit_ticks},
+        ]
+    )
 
-st.download_button(
-    label="Download Run Summary as TXT",
-    data=summary_text,
-    file_name="controlforge_demo_run_summary.txt",
-    mime="text/plain",
-)
+    st.dataframe(parameters_df, use_container_width=True)
 
-if not df.empty:
-    csv_data = df.to_csv(index=False)
+    st.divider()
+    st.header("Demo Run Summary")
+
+    s1, s2, s3, s4, s5 = st.columns(5)
+
+    s1.metric("Duration", f"{summary['duration_s']:.2f} s")
+    s2.metric("Max |θ1|", f"{summary['max_theta1']:.4f} rad")
+    s3.metric("Max |θ2|", f"{summary['max_theta2']:.4f} rad")
+    s4.metric("Max |Cart|", f"{summary['max_cart_pos']:.2f} ticks")
+    s5.metric("Telemetry Health", f"{summary['telemetry_health']:.1f}%")
+
+    report_text = f"""
+ControlForge Judge Demo Report
+
+System Health: {health_status}
+Risk Level: {risk_level}
+Status Message: {health_message}
+
+Duration: {summary['duration_s']:.2f} seconds
+Valid Packets: {st.session_state.judge_valid_packets}
+Invalid Packets: {st.session_state.judge_invalid_packets}
+Telemetry Health: {summary['telemetry_health']:.1f}%
+
+Current Raw Variables:
+theta1 = {latest['theta1']:.4f} rad
+theta2 = {latest['theta2']:.4f} rad
+theta1_dot = {latest['theta1_dot']:.4f} rad/s
+theta2_dot = {latest['theta2_dot']:.4f} rad/s
+cart_pos = {latest['cart_pos']:.2f} ticks
+cart_vel = {latest['cart_vel']:.2f} ticks/s
+motor_pwm = {latest['motor_pwm']}
+safety = {latest['safety']}
+
+Current Zeroed Variables:
+theta1_zeroed = {theta1_zeroed:.4f} rad
+theta2_zeroed = {theta2_zeroed:.4f} rad
+cart_zeroed = {cart_zeroed:.2f} ticks
+
+Maximum Values:
+max |theta1| = {summary['max_theta1']:.4f} rad
+max |theta2| = {summary['max_theta2']:.4f} rad
+max |theta1_dot| = {summary['max_theta1_dot']:.4f} rad/s
+max |theta2_dot| = {summary['max_theta2_dot']:.4f} rad/s
+max |cart_pos| = {summary['max_cart_pos']:.2f} ticks
+max |cart_vel| = {summary['max_cart_vel']:.2f} ticks/s
+""".strip()
+
+    with st.expander("View Generated Judge Report"):
+        st.text(report_text)
 
     st.download_button(
-        label="Download Telemetry Data as CSV",
-        data=csv_data,
-        file_name="controlforge_demo_telemetry.csv",
-        mime="text/csv",
+        label="Download Judge Report",
+        data=report_text,
+        file_name="controlforge_judge_report.txt",
+        mime="text/plain",
     )
 
+    st.divider()
+    st.header("Long-Scale Run Analytics")
 
-# ============================================================
-# Charts and table
-# ============================================================
+    if df.empty:
+        st.info("Click Read One Packet or turn on Auto-read to begin collecting hardware data.")
+    else:
+        graph_df = df.copy()
 
-st.divider()
-st.header("Telemetry Trends")
+        graph_df["time_s"] = (
+            graph_df["timestamp_ms"] - graph_df["timestamp_ms"].iloc[0]
+        ) / 1000.0
 
-if df.empty:
-    st.write("No telemetry data yet.")
-else:
-    plot_df = df.copy()
-    plot_df["time_s"] = plot_df["timestamp_ms"] / 1000
-
-    selected_signals = st.multiselect(
-        "Choose signals to graph",
-        ["theta1", "theta2", "theta1_dot", "theta2_dot", "cart_pos", "cart_vel"],
-        default=["theta1", "theta2", "cart_pos"],
-    )
-
-    if selected_signals:
-        trend_fig = go.Figure()
-
-        for signal in selected_signals:
-            trend_fig.add_trace(go.Scatter(
-                x=plot_df["time_s"],
-                y=plot_df[signal],
-                mode="lines",
-                name=DISPLAY_NAMES[signal],
-            ))
-
-        trend_fig.update_layout(
-            height=400,
-            xaxis_title="Time (s)",
-            yaxis_title="Value",
-            margin=dict(l=10, r=10, t=30, b=10),
+        graph_df["theta1_zeroed"] = graph_df["theta1"].apply(
+            lambda value: -wrap_to_pi(value - st.session_state.theta1_zero)
+            if st.session_state.theta1_flip
+            else wrap_to_pi(value - st.session_state.theta1_zero)
         )
 
-        st.plotly_chart(trend_fig, use_container_width=True)
+        graph_df["theta2_zeroed"] = graph_df["theta2"].apply(
+            lambda value: -wrap_to_pi(value - st.session_state.theta2_zero)
+            if st.session_state.theta2_flip
+            else wrap_to_pi(value - st.session_state.theta2_zero)
+        )
 
-    with st.expander("View recent telemetry table"):
-        st.dataframe(df.tail(25), use_container_width=True)
+        graph_df["cart_zeroed"] = graph_df["cart_pos"] - st.session_state.cart_zero
 
+        selected_signals = st.multiselect(
+            "Choose variables to graph",
+            [
+                "theta1",
+                "theta2",
+                "theta1_zeroed",
+                "theta2_zeroed",
+                "theta1_dot",
+                "theta2_dot",
+                "cart_pos",
+                "cart_zeroed",
+                "cart_vel",
+                "motor_pwm",
+            ],
+            default=["theta1_zeroed", "theta2_zeroed", "cart_zeroed"],
+        )
 
-# ============================================================
-# Architecture explanation
-# ============================================================
+        if selected_signals:
+            chart_df = graph_df.set_index("time_s")[selected_signals]
+            st.line_chart(chart_df)
 
-st.divider()
-st.header("Why This Demo Matters")
+        with st.expander("Recent Data Table"):
+            st.dataframe(graph_df.tail(100), use_container_width=True)
 
-a1, a2, a3 = st.columns(3)
+        st.download_button(
+            label="Download Hardware Data CSV",
+            data=graph_df.to_csv(index=False),
+            file_name="controlforge_hardware_data.csv",
+            mime="text/csv",
+        )
 
-with a1:
-    st.subheader("1. Hardware Pipeline")
-    st.write(
-        "The Teensy sends telemetry packets through USB Serial. "
-        "The dashboard reads the packets and converts them into live state values."
+    st.divider()
+    st.header("What Judges Should Notice")
+
+    j1, j2, j3 = st.columns(3)
+
+    with j1:
+        st.subheader("1. Real Hardware Data")
+        st.write("The dashboard is receiving live encoder data from the Teensy.")
+
+    with j2:
+        st.subheader("2. Useful Parameters")
+        st.write("Serial settings, safety limits, zero offsets, and direction flips can be adjusted live.")
+
+    with j3:
+        st.subheader("3. Analysis Ready")
+        st.write("Runs are graphed, summarized, and downloadable as CSV/text reports.")
+
+    st.markdown(
+        "**Pitch line:** ControlForge makes a difficult physical control system measurable, debuggable, and safer to test."
     )
 
-with a2:
-    st.subheader("2. Live Visualization")
-    st.write(
-        "The pendulum animation turns raw numbers into a physical-looking system, "
-        "so judges can understand what the data means."
-    )
-
-with a3:
-    st.subheader("3. Run Report")
-    st.write(
-        "After a demo run, ControlForge summarizes system behavior, packet health, "
-        "maximum angles, cart movement, and safety status."
-    )
+    if auto_read:
+        time.sleep(float(refresh_delay))
+        st.rerun()
 
 
-# ============================================================
-# Auto refresh
-# ============================================================
-
-if auto_update:
-    time.sleep(refresh_delay)
-    st.rerun()
+if __name__ == "__main__":
+    render_judge_demo_page()
